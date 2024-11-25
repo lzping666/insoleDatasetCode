@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.metrics import r2_score
 
-from caculate.fsr_processor import load_fsr_data, preprocess_fsr_data
-from caculate.pose_processor import load_pose_data,preprocess_pose_data
+from caculate.fsr_processor import load_fsr_data
+from caculate.pose_processor import load_pose_data
 
 
 class LSTMModel(nn.Module):

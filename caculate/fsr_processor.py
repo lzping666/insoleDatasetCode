@@ -74,52 +74,9 @@ def preprocess_fsr_data(fsr_values, smooth_window=5):
     return processed_values, scaler
 
 
-# def preprocess_fsr_data(fsr_values, smooth_window=5):
-#     """
-#     预处理FSR数据
-#
-#     Parameters:
-#     fsr_values: 原始FSR数据
-#     smooth_window: 平滑窗口大小
-#
-#     Returns:
-#     processed_values: 处理后的FSR数据
-#     """
-#     # 移动平均平滑
-#     processed_values = pd.DataFrame(fsr_values).rolling(
-#         window=smooth_window, center=True).mean().fillna(method='bfill').fillna(method='ffill').values
-#
-#     # 归一化
-#     processed_values = (processed_values - processed_values.min(axis=0)) / \
-#                        (processed_values.max(axis=0) - processed_values.min(axis=0))
-#
-#     return processed_values
 
-# def preprocess_fsr_data(fsr_values, smooth_window=5):
-#     """
-#     预处理FSR数据
-#
-#     Parameters:
-#     fsr_values: 原始FSR数据
-#     smooth_window: 平滑窗口大小
-#
-#     Returns:
-#     processed_values: 处理后的FSR数据
-#     data_min: 每个传感器的最小值
-#     data_max: 每个传感器的最大值
-#     """
-#     # 移动平均平滑
-#     processed_values = pd.DataFrame(fsr_values).rolling(
-#         window=smooth_window, center=True).mean().fillna(method='bfill').fillna(method='ffill').values
-#
-#     # 保存原始范围
-#     data_min = processed_values.min(axis=0)
-#     data_max = processed_values.max(axis=0)
-#
-#     # 归一化
-#     processed_values = (processed_values - data_min) / (data_max - data_min)
-#
-#     return processed_values, data_min, data_max
+
+
 
 # 使用示例
 if __name__ == "__main__":

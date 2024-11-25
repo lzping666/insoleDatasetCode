@@ -27,9 +27,6 @@ def preprocess_fsr_data(fsr_values, smooth_window=5):
     processed_values = pd.DataFrame(fsr_values).rolling(
         window=smooth_window, center=True).mean().fillna(method='bfill').fillna(method='ffill').values
 
-    # 归一化
-    processed_values = (processed_values - processed_values.min(axis=0)) / \
-                       (processed_values.max(axis=0) - processed_values.min(axis=0))
 
     return processed_values
 
@@ -57,13 +54,6 @@ def preprocess_pose_data(pose_data, smooth_window=5):
             smoothed = values.rolling(window=smooth_window, center=True).mean()
             processed_pose[:, i, j] = smoothed.fillna(method='bfill').fillna(method='ffill')
 
-    # 对每个关键点的坐标进行归一化
-    for i in range(num_keypoints):
-        for j in range(num_coordinates):
-            min_val = processed_pose[:, i, j].min()
-            max_val = processed_pose[:, i, j].max()
-            if max_val > min_val:  # 避免除以零
-                processed_pose[:, i, j] = (processed_pose[:, i, j] - min_val) / (max_val - min_val)
 
     return processed_pose
 class LSTMModel(nn.Module):
@@ -114,6 +104,8 @@ class PyTorchFSRPredictor:
         return LSTMModel(input_size, self.hidden_size, self.num_layers, output_size, self.dropout_rate)
 
 
+
+    # 准备用于训练和验证的序列数据 姿态数据从三维（frames, 33, 3）展平为二维（frames, 99）
     def prepare_sequence_data(self, pose_data, fsr_data, sequence_length, test_size=0.2):
         X_sequences = []
         y_sequences = []
@@ -219,45 +211,64 @@ class PyTorchFSRPredictor:
         noise = torch.randn_like(sequence) * noise_factor
         return sequence + noise
 
+
     def process_sequence(self, pose_data, fsr_data):
-        sequence_length = 32
-        pose_features = pose_data.reshape(pose_data.shape[0], -1)
+        try:
+            sequence_length = 64
+            pose_features = pose_data.reshape(pose_data.shape[0], -1)
 
-        X_sequences = []
-        for i in range(len(pose_features) - sequence_length + 1):
-            X_sequences.append(pose_features[i:i + sequence_length])
+            X_sequences = []
+            for i in range(len(pose_features) - sequence_length + 1):
+                X_sequences.append(pose_features[i:i + sequence_length])
 
-        X_sequences = np.array(X_sequences)
+            X_sequences = np.array(X_sequences)
 
-        # 调整reshape维度以匹配训练时的维度
-        X_sequences_reshaped = X_sequences.reshape(-1, pose_data.shape[1] * pose_data.shape[2])
-        X_scaled = self.scaler_pose.transform(X_sequences_reshaped)
-        X_scaled = X_scaled.reshape(X_sequences.shape)
+            # Use the saved scaler for transformation
+            X_sequences_reshaped = X_sequences.reshape(-1, pose_data.shape[1] * pose_data.shape[2])
+            X_scaled = self.scaler_pose.transform(X_sequences_reshaped)
+            X_scaled = X_scaled.reshape(X_sequences.shape)
 
-        X = torch.FloatTensor(X_scaled).to(self.device)
+            X = torch.FloatTensor(X_scaled).to(self.device)
 
-        self.model.eval()
-        with torch.no_grad():
-            predicted_sequences = self.model(X)
-            predicted_sequences = predicted_sequences.cpu().numpy()
+            self.model = self.model.to(self.device)
+            self.model.eval()
 
-        predicted_fsr = predicted_sequences[:, -1, :]
+            batch_size = 32  # Adjust based on your GPU memory
+            predictions = []
 
-        padding = np.zeros((sequence_length - 1, predicted_fsr.shape[1]))
-        predicted_fsr = np.vstack([padding, predicted_fsr])
+            for i in range(0, len(X), batch_size):
+                batch = X[i:i + batch_size]
+                with torch.no_grad():
+                    batch_predictions = self.model(batch)
+                    batch_predictions = batch_predictions.cpu().numpy()
+                    predictions.append(batch_predictions)
 
-        # 确保维度匹配训练时的维度，反归一化inverse
-        predicted_fsr_reshaped = predicted_fsr.reshape(-1, fsr_data.shape[1])
-        predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
-        print(f"Predicted FSR after inverse transform: min={predicted_fsr.min()}, max={predicted_fsr.max()}")
-        # **剪裁负值，确保数据合理**
-        predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
+            predicted_sequences = np.concatenate(predictions, axis=0)
 
-        predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
-        return predicted_fsr_smoothed
+            predicted_fsr = predicted_sequences[:, -1, :]
 
+            padding = np.zeros((sequence_length - 1, predicted_fsr.shape[1]))
+            predicted_fsr = np.vstack([padding, predicted_fsr])
+
+            # 反归一化
+            predicted_fsr_reshaped = predicted_fsr.reshape(-1, fsr_data.shape[1])
+            predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
+            # **剪裁负值，确保数据合理**
+            predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
+            predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
+            return predicted_fsr_smoothed
+
+        except Exception as e:
+            print(f"Error occurred: {str(e)}")
+            print(f"Error type: {type(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+
+    #对输入的姿态数据进行处理，并使用训练好的模型进行预测
     # def process_sequence(self, pose_data, fsr_data):
-    #     sequence_length = 32
+    #     sequence_length = 1
     #     pose_features = pose_data.reshape(pose_data.shape[0], -1)
     #
     #     X_sequences = []
@@ -266,13 +277,9 @@ class PyTorchFSRPredictor:
     #
     #     X_sequences = np.array(X_sequences)
     #
-    #     # 使用保存的scaler
-    #     if hasattr(self, 'scaler_pose'):
-    #         X_scaled = self.scaler_pose.transform(X_sequences.reshape(-1, X_sequences.shape[-1]))
-    #     else:
-    #         scaler_pose = MinMaxScaler(feature_range=(0, 1))
-    #         X_scaled = scaler_pose.fit_transform(X_sequences.reshape(-1, X_sequences.shape[-1]))
-    #
+    #     # 调整reshape维度以匹配训练时的维度
+    #     X_sequences_reshaped = X_sequences.reshape(-1, pose_data.shape[1] * pose_data.shape[2])
+    #     X_scaled = self.scaler_pose.transform(X_sequences_reshaped)
     #     X_scaled = X_scaled.reshape(X_sequences.shape)
     #
     #     X = torch.FloatTensor(X_scaled).to(self.device)
@@ -282,49 +289,42 @@ class PyTorchFSRPredictor:
     #         predicted_sequences = self.model(X)
     #         predicted_sequences = predicted_sequences.cpu().numpy()
     #
-    #     # 取每个序列的最后一个预测值
     #     predicted_fsr = predicted_sequences[:, -1, :]
     #
-    #     # 补充序列开头的预测结果
     #     padding = np.zeros((sequence_length - 1, predicted_fsr.shape[1]))
     #     predicted_fsr = np.vstack([padding, predicted_fsr])
     #
-    #     # 如果需要反转归一化，使用保存的scaler
-    #     # if hasattr(self, 'scaler_fsr'):
-    #     #predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr)
+    #     # 确保维度匹配训练时的维度，反归一化inverse
     #     predicted_fsr_reshaped = predicted_fsr.reshape(-1, fsr_data.shape[1])
     #     predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
-    #     # 平滑处理
+    #     # print(f"Predicted FSR after inverse transform: min={predicted_fsr.min()}, max={predicted_fsr.max()}")
+    #     # **剪裁负值，确保数据合理**
+    #     predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
+    #
     #     predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
     #     return predicted_fsr_smoothed
+
 
     def evaluate_model(self, true_fsr, predicted_fsr):
         """评估模型性能"""
         # 确保数据形状一致
         assert true_fsr.shape == predicted_fsr.shape, "Shape mismatch between true and predicted values"
 
-        #todo
-        # 如果true_fsr还没有归一化，先进行归一化
-        if hasattr(self, 'scaler_fsr'):
-            true_fsr_normalized = self.scaler_fsr.transform(true_fsr)
-            predicted_fsr_normalized = self.scaler_fsr.transform(predicted_fsr)
-        else:
-            true_fsr_normalized = true_fsr
-            predicted_fsr_normalized = predicted_fsr
-
-        # 计算评估指标
-        mse = np.mean((true_fsr_normalized - predicted_fsr_normalized) ** 2)
+        # 计算评估指标（直接基于原始数据）
+        mse = np.mean((true_fsr - predicted_fsr) ** 2)
         rmse = np.sqrt(mse)
-        mae = np.mean(np.abs(true_fsr_normalized - predicted_fsr_normalized))
+        mae = np.mean(np.abs(true_fsr - predicted_fsr))
 
-        # 计算R2分数
+        # 计算 R² 分数
         r2_scores = []
-        for i in range(true_fsr_normalized.shape[1]):
-            r2 = r2_score(true_fsr_normalized[:, i], predicted_fsr_normalized[:, i])
+        for i in range(true_fsr.shape[1]):
+            r2 = r2_score(true_fsr[:, i], predicted_fsr[:, i])
             r2_scores.append(r2)
         r2 = np.mean(r2_scores)
 
         return mse, rmse, mae, r2
+
+
 
 def moving_average(data, window_size, axis=0):
     if window_size <= 0:
@@ -344,16 +344,15 @@ if __name__ == '__main__':
 
     pose_csv_file_path = "../datasets/pose3.csv"
     pose_data = load_pose_data(pose_csv_file_path)
-    #todo
     processed_pose_data = preprocess_pose_data(pose_data)
-    print(f"Processed pose data range: min={processed_pose_data.min()}, max={processed_pose_data.max()}")
-    print(f"Processed fsr data range: min={processed_fsr.min()}, max={processed_fsr.max()}")
+    # print(f"Processed pose data range: min={processed_pose_data.min()}, max={processed_pose_data.max()}")
+    # print(f"Processed fsr data range: min={processed_fsr.min()}, max={processed_fsr.max()}")
     num_samples = min(processed_pose_data.shape[0], processed_fsr.shape[0])
     processed_pose_data = processed_pose_data[:num_samples]
     processed_fsr = processed_fsr[:num_samples]
 
     # 设置序列长度
-    sequence_length = 32
+    sequence_length = 64
 
     predictor = PyTorchFSRPredictor(
         hidden_size=256,  # 增加隐藏层大小
@@ -368,8 +367,7 @@ if __name__ == '__main__':
     # 准备序列数据
     train_loader, val_loader, scaler_pose, scaler_fsr = predictor.prepare_sequence_data(
         processed_pose_data, processed_fsr, sequence_length)
-    print(f"Scaler pose range: min={scaler_pose.data_min_}, max={scaler_pose.data_max_}")
-    print(f"Scaler fsr range: min={scaler_fsr.data_min_}, max={scaler_fsr.data_max_}")
+
     # 构建和训练模型
     input_size = processed_pose_data.shape[1] * processed_pose_data.shape[2]  # 33*3=99 特征
     output_size = processed_fsr.shape[1]  # FSR传感器数量
