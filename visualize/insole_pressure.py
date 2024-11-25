@@ -6,7 +6,7 @@ import matplotlib.animation as animation
 from matplotlib.image import imread
 
 # 从CSV文件读取数据
-data = pd.read_csv('datasets/labeled/left_lys_data.csv')
+data = pd.read_csv('../datasets/labeled/left_lys_data.csv')
 
 # 假设CSV文件中每行是一个字符串，数字之间用空格隔开
 positions = [(20, 1.4), (16, 1.25), (14, 3.2), (3.6, 2.2)]
