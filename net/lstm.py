@@ -54,6 +54,13 @@ def preprocess_pose_data(pose_data, smooth_window=5):
             smoothed = values.rolling(window=smooth_window, center=True).mean()
             processed_pose[:, i, j] = smoothed.fillna(method='bfill').fillna(method='ffill')
 
+    # # 对每个关键点的坐标进行归一化
+    # for i in range(num_keypoints):
+    #     for j in range(num_coordinates):
+    #         min_val = processed_pose[:, i, j].min()
+    #         max_val = processed_pose[:, i, j].max()
+    #         if max_val > min_val:  # 避免除以零
+    #             processed_pose[:, i, j] = (processed_pose[:, i, j] - min_val) / (max_val - min_val)
 
     return processed_pose
 class LSTMModel(nn.Module):
@@ -214,7 +221,7 @@ class PyTorchFSRPredictor:
 
     def process_sequence(self, pose_data, fsr_data):
         try:
-            sequence_length = 64
+            sequence_length = 56
             pose_features = pose_data.reshape(pose_data.shape[0], -1)
 
             X_sequences = []
@@ -315,6 +322,18 @@ class PyTorchFSRPredictor:
         rmse = np.sqrt(mse)
         mae = np.mean(np.abs(true_fsr - predicted_fsr))
 
+        # 计算相对误差 (MAPE: Mean Absolute Percentage Error)
+        # 只在true_fsr大于阈值时计算相对误差
+        # 设置范围
+        lower_threshold = 10
+        upper_threshold = 650
+        mask = true_fsr > (true_fsr > lower_threshold) & (true_fsr < upper_threshold)
+        if np.any(mask):
+            mape = np.mean(np.abs((true_fsr[mask] - predicted_fsr[mask]) / true_fsr[mask])) * 100
+        else:
+            mape = float('nan')
+
+
         # 计算 R² 分数
         r2_scores = []
         for i in range(true_fsr.shape[1]):
@@ -322,7 +341,7 @@ class PyTorchFSRPredictor:
             r2_scores.append(r2)
         r2 = np.mean(r2_scores)
 
-        return mse, rmse, mae, r2
+        return mse, rmse, mae, r2,mape
 
 
 
@@ -342,7 +361,7 @@ if __name__ == '__main__':
     timestamps, fsr_values = load_fsr_data(csv_file_path)
     processed_fsr = preprocess_fsr_data(fsr_values)
 
-    pose_csv_file_path = "../datasets/pose3.csv"
+    pose_csv_file_path = "../datasets/pose2.csv"
     pose_data = load_pose_data(pose_csv_file_path)
     processed_pose_data = preprocess_pose_data(pose_data)
     # print(f"Processed pose data range: min={processed_pose_data.min()}, max={processed_pose_data.max()}")
@@ -352,10 +371,10 @@ if __name__ == '__main__':
     processed_fsr = processed_fsr[:num_samples]
 
     # 设置序列长度
-    sequence_length = 64
+    sequence_length = 56
 
     predictor = PyTorchFSRPredictor(
-        hidden_size=256,  # 增加隐藏层大小
+        hidden_size=512,  # 增加隐藏层大小
         num_layers=4,  # 增加层数
         learning_rate=0.001,  # 减小学习率
         batch_size=128,  # 增加批次大小
@@ -382,12 +401,13 @@ if __name__ == '__main__':
     processed_fsr = processed_fsr[:min_length]
     predicted_fsr = predicted_fsr[:min_length]
 
-    mse, rmse, mae, r2 = predictor.evaluate_model(processed_fsr, predicted_fsr)
+    mse, rmse, mae, r2, mape = predictor.evaluate_model(processed_fsr, predicted_fsr)
 
     print(f"MSE: {mse:.4f}")
     print(f"RMSE: {rmse:.4f}")
     print(f"MAE: {mae:.4f}")
     print(f"R2 Score: {r2:.4f}")
+    print(f"MAPE: {mape:.4f}" + '%')
 
 
     # Plotting the results

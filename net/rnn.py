@@ -20,6 +20,9 @@ from caculate.fsr_processor import load_fsr_data, preprocess_fsr_data
 # 添加了dropout进行正则化
 
 
+
+
+
 def load_and_preprocess_pose_data(pose_csv_path):
     """加载和预处理姿态数据"""
     # 读取CSV文件

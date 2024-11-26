@@ -4,16 +4,46 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import r2_score, mean_absolute_error
-from sklearn.model_selection import KFold
-from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split, Subset
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import matplotlib.pyplot as plt
 
-from caculate.fsr_processor import load_fsr_data, preprocess_fsr_data
+from caculate.fsr_processor import load_fsr_data
 
 
+def preprocess_fsr_data(fsr_values, smooth_window=5):
+    """
+    预处理FSR数据
 
+    Parameters:
+    fsr_values: 原始FSR数据
+    smooth_window: 平滑窗口大小
+
+    Returns:
+    processed_values: 归一化后的FSR数据 (NumPy数组)
+    scaler: 归一化的MinMaxScaler对象
+    """
+    # 移动平均平滑
+    smoothed_values = pd.DataFrame(fsr_values).rolling(
+        window=smooth_window, center=True).mean().fillna(method='bfill').fillna(method='ffill').values
+
+    # 初始化 MinMaxScaler
+    scaler = MinMaxScaler()
+
+    # 使用原始数据进行 fit
+    scaler.fit(fsr_values)  # 这里确保 scaler 的范围是基于原始数据的范围
+
+    # 对平滑后的数据进行归一化
+    processed_values = scaler.transform(smoothed_values)
+
+    # 确保返回的是 NumPy 数组
+    if isinstance(processed_values, pd.DataFrame):
+        processed_values = processed_values.values
+    elif isinstance(processed_values, tuple):
+        processed_values = np.array(processed_values)
+
+    return processed_values, scaler
 
 def load_and_preprocess_pose_data(pose_csv_path):
     """加载和预处理姿态数据"""
@@ -261,7 +291,9 @@ if __name__ == '__main__':
     # 读取和预处理FSR数据
     timestamps, fsr_values = load_fsr_data(fsr_csv_path)
     processed_fsr = preprocess_fsr_data(fsr_values)
-
+    # print(type(pose_data))  # 应该是 <class 'numpy.ndarray'>
+    # print(type(processed_fsr))  # 应该是 <class 'numpy.ndarray'>
+    processed_fsr = np.array(processed_fsr)
     # 确保数据长度匹配，选择较小的长度
     num_samples = min(pose_data.shape[0], processed_fsr.shape[0])
     pose_data = pose_data[:num_samples]
