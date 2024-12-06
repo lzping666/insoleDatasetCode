@@ -1,7 +1,7 @@
 import getpose
 from visualize import visualization
 import fix_foot_data
-import find_best_time_diff
+from aligned import find_best_time_diff
 import footdata2csv
 import merge_data
 

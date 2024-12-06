@@ -5,25 +5,51 @@ from sklearn.preprocessing import MinMaxScaler
 
 def load_fsr_data(csv_file_path):
     """
-    读取FSR数据文件
+    读取 FSR 数据文件
 
     Parameters:
-    csv_file_path: FSR数据文件的路径
+    csv_file_path: FSR 数据文件的路径
 
     Returns:
-    timestamps: 时间戳数组
-    fsr_values: FSR压力值数组 shape: (frames, 4)
+    timestamps: 时间戳数组（以浮点数形式存储的 UNIX 时间戳）
+    fsr_values: FSR 压力值数组 shape: (frames, 4)
     """
-    # 读取CSV文件，假设没有表头，用空格分隔
-    # df = pd.read_csv(csv_file_path, header=None, delimiter=' ')
-    df = pd.read_csv(csv_file_path, sep=",", header=None, dtype=np.float64)  # 明确指定 header=None
-    # 提取时间戳（第一列）
-    timestamps = df[0].values
+    # 读取 CSV 文件，假设第一行是表头
+    df = pd.read_csv(csv_file_path, sep=",", header=0)
 
-    # 提取最后四列作为FSR值
+    # 将时间戳列转换为 UNIX 时间戳（秒级，带小数点）
+    # df["timestamp"] = pd.to_datetime(df["timestamp"]).astype('int64') / 1e9
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).view('int64') / 1e9
+    # 提取时间戳（第一列）
+    timestamps = df["timestamp"].values
+
+    # 提取最后四列作为 FSR 值
     fsr_values = df.iloc[:, -4:].values
 
     return timestamps, fsr_values
+
+
+# def load_fsr_data(csv_file_path):
+#     """
+#     读取FSR数据文件
+#
+#     Parameters:
+#     csv_file_path: FSR数据文件的路径
+#
+#     Returns:
+#     timestamps: 时间戳数组
+#     fsr_values: FSR压力值数组 shape: (frames, 4)
+#     """
+#     # 读取CSV文件，假设没有表头，用空格分隔
+#     # df = pd.read_csv(csv_file_path, header=None, delimiter=' ')
+#     df = pd.read_csv(csv_file_path, sep=",", header=None, dtype=np.float64)  # 明确指定 header=None
+#     # 提取时间戳（第一列）
+#     timestamps = df[0].values
+#
+#     # 提取最后四列作为FSR值
+#     fsr_values = df.iloc[:, -4:].values
+#
+#     return timestamps, fsr_values
 
 
 def process_fsr_data(csv_file_path):

@@ -2,6 +2,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import numpy as np
 import matplotlib.pyplot as plt
@@ -53,14 +54,6 @@ def preprocess_pose_data(pose_data, smooth_window=5):
             values = pd.Series(pose_values[:, i, j])
             smoothed = values.rolling(window=smooth_window, center=True).mean()
             processed_pose[:, i, j] = smoothed.fillna(method='bfill').fillna(method='ffill')
-
-    # # 对每个关键点的坐标进行归一化
-    # for i in range(num_keypoints):
-    #     for j in range(num_coordinates):
-    #         min_val = processed_pose[:, i, j].min()
-    #         max_val = processed_pose[:, i, j].max()
-    #         if max_val > min_val:  # 避免除以零
-    #             processed_pose[:, i, j] = (processed_pose[:, i, j] - min_val) / (max_val - min_val)
 
     return processed_pose
 class LSTMModel(nn.Module):
@@ -133,7 +126,7 @@ class PyTorchFSRPredictor:
         self.scaler_pose = scaler_pose  # 保存pose_scaler
 
         # 创建序列
-        stride = 2
+        stride = 1
         for i in range(0, len(pose_features_scaled) - sequence_length + 1, stride):
             X_sequences.append(pose_features_scaled[i:i + sequence_length])
             y_sequences.append(fsr_scaled[i:i + sequence_length])
@@ -172,9 +165,16 @@ class PyTorchFSRPredictor:
 
         return train_loader, test_loader, scaler_pose, scaler_fsr
 
+
+
     def train_model(self, train_loader, val_loader):
         criterion = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
+                                      verbose=True)  # Adjust learning rate
+        patience = 10  # Early stopping patience
+        best_val_loss = float('inf')
+        early_stop_counter = 0
 
         for epoch in range(self.num_epochs):
             # Training phase
@@ -196,12 +196,28 @@ class PyTorchFSRPredictor:
                     outputs = self.model(batch_X)
                     val_loss += criterion(outputs, batch_y).item()
 
+            # Compute average losses
             train_loss /= len(train_loader)
             val_loss /= len(val_loader)
 
+            # Scheduler step
+            scheduler.step(val_loss)
+
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                early_stop_counter = 0  # Reset counter if validation loss improves
+            else:
+                early_stop_counter += 1
+                if early_stop_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}. Best Val Loss: {best_val_loss:.4f}")
+                    break
+
+            # Print progress
             if epoch % 10 == 0:
                 print(f'Epoch [{epoch}/{self.num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
 
+        print("Training complete.")
 
     def moving_average(self, data, window_size=10):
         """
@@ -221,7 +237,7 @@ class PyTorchFSRPredictor:
 
     def process_sequence(self, pose_data, fsr_data):
         try:
-            sequence_length = 56
+            sequence_length = 32
             pose_features = pose_data.reshape(pose_data.shape[0], -1)
 
             X_sequences = []
@@ -262,8 +278,7 @@ class PyTorchFSRPredictor:
             predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
             # **剪裁负值，确保数据合理**
             predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
-            predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
-            return predicted_fsr_smoothed
+            return predicted_fsr
 
         except Exception as e:
             print(f"Error occurred: {str(e)}")
@@ -273,43 +288,6 @@ class PyTorchFSRPredictor:
             raise
 
 
-    #对输入的姿态数据进行处理，并使用训练好的模型进行预测
-    # def process_sequence(self, pose_data, fsr_data):
-    #     sequence_length = 1
-    #     pose_features = pose_data.reshape(pose_data.shape[0], -1)
-    #
-    #     X_sequences = []
-    #     for i in range(len(pose_features) - sequence_length + 1):
-    #         X_sequences.append(pose_features[i:i + sequence_length])
-    #
-    #     X_sequences = np.array(X_sequences)
-    #
-    #     # 调整reshape维度以匹配训练时的维度
-    #     X_sequences_reshaped = X_sequences.reshape(-1, pose_data.shape[1] * pose_data.shape[2])
-    #     X_scaled = self.scaler_pose.transform(X_sequences_reshaped)
-    #     X_scaled = X_scaled.reshape(X_sequences.shape)
-    #
-    #     X = torch.FloatTensor(X_scaled).to(self.device)
-    #
-    #     self.model.eval()
-    #     with torch.no_grad():
-    #         predicted_sequences = self.model(X)
-    #         predicted_sequences = predicted_sequences.cpu().numpy()
-    #
-    #     predicted_fsr = predicted_sequences[:, -1, :]
-    #
-    #     padding = np.zeros((sequence_length - 1, predicted_fsr.shape[1]))
-    #     predicted_fsr = np.vstack([padding, predicted_fsr])
-    #
-    #     # 确保维度匹配训练时的维度，反归一化inverse
-    #     predicted_fsr_reshaped = predicted_fsr.reshape(-1, fsr_data.shape[1])
-    #     predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
-    #     # print(f"Predicted FSR after inverse transform: min={predicted_fsr.min()}, max={predicted_fsr.max()}")
-    #     # **剪裁负值，确保数据合理**
-    #     predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
-    #
-    #     predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
-    #     return predicted_fsr_smoothed
 
 
     def evaluate_model(self, true_fsr, predicted_fsr):
@@ -325,11 +303,11 @@ class PyTorchFSRPredictor:
         # 计算相对误差 (MAPE: Mean Absolute Percentage Error)
         # 只在true_fsr大于阈值时计算相对误差
         # 设置范围
-        lower_threshold = 10
-        upper_threshold = 650
+        lower_threshold = 0
+        upper_threshold = 1000
         mask = true_fsr > (true_fsr > lower_threshold) & (true_fsr < upper_threshold)
         if np.any(mask):
-            mape = np.mean(np.abs((true_fsr[mask] - predicted_fsr[mask]) / true_fsr[mask])) * 100
+            mape = np.mean(np.abs((true_fsr[mask] - predicted_fsr[mask]) / true_fsr[mask]) ) * 100
         else:
             mape = float('nan')
 
@@ -357,11 +335,11 @@ def moving_average(data, window_size, axis=0):
 if __name__ == '__main__':
     plt.rcParams['font.sans-serif'] = ['SimHei']
     plt.rcParams['axes.unicode_minus'] = False
-    csv_file_path = "../datasets/downsampled_insole_data4.csv"
+    csv_file_path = "../datasets/filtered_insole_data4.csv"
     timestamps, fsr_values = load_fsr_data(csv_file_path)
     processed_fsr = preprocess_fsr_data(fsr_values)
 
-    pose_csv_file_path = "../datasets/pose2.csv"
+    pose_csv_file_path = "../datasets/pose3.csv"
     pose_data = load_pose_data(pose_csv_file_path)
     processed_pose_data = preprocess_pose_data(pose_data)
     # print(f"Processed pose data range: min={processed_pose_data.min()}, max={processed_pose_data.max()}")
@@ -371,11 +349,11 @@ if __name__ == '__main__':
     processed_fsr = processed_fsr[:num_samples]
 
     # 设置序列长度
-    sequence_length = 56
+    sequence_length = 32
 
     predictor = PyTorchFSRPredictor(
-        hidden_size=512,  # 增加隐藏层大小
-        num_layers=4,  # 增加层数
+        hidden_size=256,  # 增加隐藏层大小
+        num_layers=5,  # 增加层数
         learning_rate=0.001,  # 减小学习率
         batch_size=128,  # 增加批次大小
         num_epochs=200,

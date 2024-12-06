@@ -2,15 +2,15 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch import device
 from torch.utils.data import DataLoader, TensorDataset, random_split
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
 from sklearn.metrics import r2_score
-
+import torch.nn.functional as F
 from caculate.fsr_processor import load_fsr_data
 from caculate.pose_processor import load_pose_data
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 def preprocess_fsr_data(fsr_values, smooth_window=5):
@@ -30,7 +30,6 @@ def preprocess_fsr_data(fsr_values, smooth_window=5):
 
 
     return processed_values
-
 
 def preprocess_pose_data(pose_data, smooth_window=5):
     """
@@ -59,83 +58,93 @@ def preprocess_pose_data(pose_data, smooth_window=5):
     return processed_pose
 
 
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout_rate=0.2):
-        super(LSTMModel, self).__init__()
+class LSTMAttentionModel(nn.Module):
+    def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers, output_size, dropout_rate=0.2):
+        super(LSTMAttentionModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
-        # 在模型初始化时记录input_size
-        self.input_size = input_size
-
-        # BatchNorm层的特征数量应该与输入特征数量匹配
-        self.batch_norm1 = nn.BatchNorm1d(input_size)
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_rate)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.batch_norm2 = nn.BatchNorm1d(hidden_size)
-        self.fc = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        # 打印输入张量的形状，用于调试
-        batch_size, seq_len, features = x.size()
-
-        # 确保features与input_size匹配
-        assert features == self.input_size, f"Input features ({features}) don't match expected input_size ({self.input_size})"
-
-        # BatchNorm1d需要(batch_size, features, seq_len)格式
-        x = x.transpose(1, 2)  # (batch_size, input_size, seq_len)
-        x = self.batch_norm1(x)
-        x = x.transpose(1, 2)  # (batch_size, seq_len, input_size)
-
         # LSTM层
-        lstm_out, _ = self.lstm(x)
+        self.lstm = nn.LSTM(seq_input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout_rate if num_layers > 1 else 0)
 
-        # 对LSTM输出应用dropout和batch normalization
-        lstm_out = self.dropout(lstm_out)
-        lstm_out = lstm_out.transpose(1, 2)  # (batch_size, hidden_size, seq_len)
-        lstm_out = self.batch_norm2(lstm_out)
-        lstm_out = lstm_out.transpose(1, 2)  # (batch_size, seq_len, hidden_size)
+        # 注意力层
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+
+        # 合并静态特征的全连接层
+        self.fc_combine = nn.Linear(hidden_size + static_input_size, hidden_size)
 
         # 输出层
-        output = self.fc(lstm_out)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_size // 2, output_size)
+        )
+
+    def forward(self, x_seq, x_static):
+        # LSTM处理序列数据
+        lstm_out, _ = self.lstm(x_seq)  # shape: (batch, seq_len, hidden_size)
+
+        # 注意力机制
+        attention_weights = self.attention(lstm_out)  # shape: (batch, seq_len, 1)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        context_vector = torch.sum(attention_weights * lstm_out, dim=1)  # shape: (batch, hidden_size)
+
+        # 合并静态特征
+        combined = torch.cat((context_vector, x_static), dim=1)
+        combined = self.fc_combine(combined)
+        combined = F.relu(combined)
+
+        # 输出层 - 扩展为序列长度
+        output = self.fc(combined)  # shape: (batch, output_size)
+        output = output.unsqueeze(1).repeat(1, x_seq.size(1), 1)  # shape: (batch, seq_len, output_size)
+
         return output
 
 class PyTorchFSRPredictor:
-    def __init__(self, hidden_size, num_layers, learning_rate=0.001, batch_size=32, num_epochs=200, dropout_rate=0.2):
+    def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers,
+                 output_size, learning_rate=0.001, batch_size=32, num_epochs=100, dropout_rate=0.2):
+        self.seq_input_size = seq_input_size
+        self.static_input_size = static_input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.output_size = output_size
         self.learning_rate = learning_rate
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.dropout_rate = dropout_rate
-        self.model = None
         self.device = torch.device("cuda:1" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else "cpu")
-        # 添加默认静态特征
-        self.default_static_features = np.array([170, 60, 42])  # 示例值：身高、体重、鞋码
-    def build_model(self, input_size, output_size):
-        return LSTMModel(input_size, self.hidden_size, self.num_layers, output_size, self.dropout_rate)
+        self.model = self.build_model()
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', patience=5, factor=0.5)
 
+    def build_model(self):
+        return LSTMAttentionModel(
+            seq_input_size=self.seq_input_size,
+            static_input_size=self.static_input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            output_size=self.output_size,
+            dropout_rate=self.dropout_rate
+        ).to(self.device)
+
+
+
+    # 准备用于训练和验证的序列数据 姿态数据从三维（frames, 33, 3）展平为二维（frames, 99）
     def prepare_sequence_data(self, pose_data, fsr_data, sequence_length, static_features, test_size=0.2):
-        """
-        准备用于训练和验证的序列数据，同时整合静态特征。
-
-        Parameters:
-        - pose_data: 姿态数据，形状 (frames, num_keypoints, num_coordinates)
-        - fsr_data: 足底压力数据，形状 (frames, num_sensors)
-        - sequence_length: 序列长度
-        - static_features: 静态特征，形状 (num_static_features,)
-        - test_size: 测试集比例
-
-        Returns:
-        - train_loader, test_loader: 训练和测试数据加载器
-        """
         X_sequences = []
         y_sequences = []
 
         # 展平姿态数据
         pose_features = pose_data.reshape(pose_data.shape[0], -1)
 
-        # 使用 MinMaxScaler 来确保数据在 0-1 之间
+        # 使用MinMaxScaler来确保数据在0-1之间
         from sklearn.preprocessing import MinMaxScaler
         scaler_pose = MinMaxScaler(feature_range=(0, 1))
         scaler_fsr = MinMaxScaler(feature_range=(0, 1))
@@ -143,26 +152,14 @@ class PyTorchFSRPredictor:
         pose_features_scaled = scaler_pose.fit_transform(pose_features)
         fsr_scaled = scaler_fsr.fit_transform(fsr_data)
 
-        # 保存 scaler 为类属性，用于后续反归一化
+        # 保存scaler为类属性，用于后续反转换
         self.scaler_fsr = scaler_fsr
         self.scaler_pose = scaler_pose
 
-        # 标准化静态特征
-        static_features = np.array(static_features).reshape(1, -1)
-        scaler_static = MinMaxScaler(feature_range=(0, 1))
-        static_features_scaled = scaler_static.fit_transform(static_features)
-        self.scaler_static = scaler_static  # 保存静态特征的 scaler
-
-        # 将静态特征扩展到每帧
-        static_features_repeated = np.tile(static_features_scaled, (pose_features_scaled.shape[0], 1))
-
-        # 将动态特征（姿态数据）与静态特征拼接
-        combined_features = np.hstack([pose_features_scaled, static_features_repeated])
-
         # 创建序列
         stride = 2
-        for i in range(0, len(combined_features) - sequence_length + 1, stride):
-            X_sequences.append(combined_features[i:i + sequence_length])
+        for i in range(0, len(pose_features_scaled) - sequence_length + 1, stride):
+            X_sequences.append(pose_features_scaled[i:i + sequence_length])
             y_sequences.append(fsr_scaled[i:i + sequence_length])
 
         X_sequences = np.array(X_sequences)
@@ -177,56 +174,83 @@ class PyTorchFSRPredictor:
         test_indices = indices[train_size:]
 
         # 创建数据加载器
-        X_train = torch.FloatTensor(X_sequences[train_indices]).to(self.device)
+        X_train_seq = torch.FloatTensor(X_sequences[train_indices]).to(self.device)
         y_train = torch.FloatTensor(y_sequences[train_indices]).to(self.device)
-        X_test = torch.FloatTensor(X_sequences[test_indices]).to(self.device)
+        X_test_seq = torch.FloatTensor(X_sequences[test_indices]).to(self.device)
         y_test = torch.FloatTensor(y_sequences[test_indices]).to(self.device)
 
         # 数据增强
-        X_train_augmented = self.add_noise(X_train)
+        X_train_seq_augmented = self.add_noise(X_train_seq)
         y_train_augmented = y_train
 
         # 合并原始数据和增强数据
-        X_train = torch.cat([X_train, X_train_augmented], dim=0)
+        X_train_seq = torch.cat([X_train_seq, X_train_seq_augmented], dim=0)
         y_train = torch.cat([y_train, y_train_augmented], dim=0)
 
-        train_dataset = TensorDataset(X_train, y_train)
-        test_dataset = TensorDataset(X_test, y_test)
+        # 准备静态特征
+        static_features = static_features.to(self.device)
+        # 扩展静态特征以匹配序列数据的批次大小
+        X_train_static = static_features.unsqueeze(0).repeat(len(X_train_seq), 1)
+        X_test_static = static_features.unsqueeze(0).repeat(len(X_test_seq), 1)
+
+        # 创建包含序列特征和静态特征的数据集
+        train_dataset = TensorDataset(X_train_seq, X_train_static, y_train)
+        test_dataset = TensorDataset(X_test_seq, X_test_static, y_test)
 
         train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
         test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
 
         return train_loader, test_loader, scaler_pose, scaler_fsr
 
+    # 修改训练过程以处理注意力权重
     def train_model(self, train_loader, val_loader):
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        best_val_loss = float('inf')
+        patience = 10
+        patience_counter = 0
 
         for epoch in range(self.num_epochs):
-            # Training phase
+            # 训练阶段
             self.model.train()
             train_loss = 0
-            for batch_X, batch_y in train_loader:
-                optimizer.zero_grad()
-                outputs = self.model(batch_X)
-                loss = criterion(outputs, batch_y)
+            for batch_seq, batch_static, batch_y in train_loader:
+                self.optimizer.zero_grad()
+
+                outputs = self.model(batch_seq, batch_static)
+                # 确保输出和目标具有相同的维度
+                batch_y = batch_y.view(outputs.shape)
+
+                loss = self.criterion(outputs, batch_y)
                 loss.backward()
-                optimizer.step()
+                self.optimizer.step()
                 train_loss += loss.item()
 
-            # Validation phase
+            # 验证阶段
             self.model.eval()
             val_loss = 0
             with torch.no_grad():
-                for batch_X, batch_y in val_loader:
-                    outputs = self.model(batch_X)
-                    val_loss += criterion(outputs, batch_y).item()
+                for batch_seq, batch_static, batch_y in val_loader:
+                    outputs = self.model(batch_seq, batch_static)
+                    batch_y = batch_y.view(outputs.shape)
+                    loss = self.criterion(outputs, batch_y)
+                    val_loss += loss.item()
 
-            train_loss /= len(train_loader)
-            val_loss /= len(val_loader)
+            # 更新学习率
+            self.scheduler.step(val_loss)
+
+            # 早停
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
 
             if epoch % 10 == 0:
-                print(f'Epoch [{epoch}/{self.num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+                print(f'Epoch {epoch}/{self.num_epochs}, Training Loss: {train_loss / len(train_loader):.4f}, Validation Loss: {val_loss / len(val_loader):.4f}')
+
 
 
     def moving_average(self, data, window_size=10):
@@ -244,61 +268,66 @@ class PyTorchFSRPredictor:
         noise = torch.randn_like(sequence) * noise_factor
         return sequence + noise
 
-    def process_sequence(self, pose_data, fsr_data, static_features=None):
+
+
+    def process_sequence(self, pose_data, fsr_data, static_features):
         try:
-            sequence_length = 40
+            sequence_length = 32
             pose_features = pose_data.reshape(pose_data.shape[0], -1)
 
-            # 如果没有提供静态特征，使用默认值
-            if static_features is None:
-                static_features = self.default_static_features  # 未归一化的原始值
-
-            # 处理静态特征 - 使用与训练时相同的scaler进行归一化
-            static_features = np.array(static_features).reshape(1, -1)
-            static_features_scaled = self.scaler_static.transform(static_features)  # 使用保存的scaler进行归一化
-
-            # 使用保存的scaler转换姿态特征
-            pose_scaled = self.scaler_pose.transform(pose_features)
-
-            # 将归一化后的静态特征扩展到每一帧
-            static_features_repeated = np.tile(static_features_scaled, (pose_features.shape[0], 1))
-
-            # 合并归一化后的姿态特征和静态特征
-            combined_features = np.hstack([pose_scaled, static_features_repeated])
-
-            # 创建序列
             X_sequences = []
-            for i in range(len(combined_features) - sequence_length + 1):
-                X_sequences.append(combined_features[i:i + sequence_length])
+            for i in range(len(pose_features) - sequence_length + 1):
+                X_sequences.append(pose_features[i:i + sequence_length])
 
             X_sequences = np.array(X_sequences)
-            X = torch.FloatTensor(X_sequences).to(self.device)
+
+            # 使用保存的scaler进行转换
+            X_sequences_reshaped = X_sequences.reshape(-1, pose_data.shape[1] * pose_data.shape[2])
+            X_scaled = self.scaler_pose.transform(X_sequences_reshaped)
+            X_scaled = X_scaled.reshape(X_sequences.shape)
+
+            # 将序列数据转换为张量
+            X_seq = torch.FloatTensor(X_scaled).to(self.device)
+
+            # 准备静态特征
+            static_features = torch.FloatTensor(static_features).to(self.device)
+            # 扩展静态特征以匹配序列数据的批次大小
+            X_static = static_features.unsqueeze(0).repeat(len(X_seq), 1)
 
             self.model = self.model.to(self.device)
             self.model.eval()
 
-            batch_size = 32
+            batch_size = 32  # 根据GPU内存调整
             predictions = []
 
-            for i in range(0, len(X), batch_size):
-                batch = X[i:i + batch_size]
+            for i in range(0, len(X_seq), batch_size):
+                batch_seq = X_seq[i:i + batch_size]
+                batch_static = X_static[i:i + batch_size]
                 with torch.no_grad():
-                    batch_predictions = self.model(batch)
-                    batch_predictions = batch_predictions.cpu().numpy()
-                    predictions.append(batch_predictions)
+                    # 模型只返回一个输出
+                    batch_predictions = self.model(batch_seq, batch_static)
+                    predictions.append(batch_predictions.cpu().numpy())
 
             predicted_sequences = np.concatenate(predictions, axis=0)
-            predicted_fsr = predicted_sequences[:, -1, :]
 
+            # 检查预测结果的维度
+            if len(predicted_sequences.shape) == 3:
+                predicted_fsr = predicted_sequences[:, -1, :]  # 如果是3D张量
+            else:
+                predicted_fsr = predicted_sequences  # 如果是2D张量
+
+            # 添加padding
             padding = np.zeros((sequence_length - 1, predicted_fsr.shape[1]))
             predicted_fsr = np.vstack([padding, predicted_fsr])
 
             # 反归一化
             predicted_fsr_reshaped = predicted_fsr.reshape(-1, fsr_data.shape[1])
             predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
+            # 剪裁负值，确保数据合理
             predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
             predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
-            return predicted_fsr_smoothed
+
+            return predicted_fsr_smoothed  # 只返回预测值
 
         except Exception as e:
             print(f"Error occurred: {str(e)}")
@@ -306,8 +335,6 @@ class PyTorchFSRPredictor:
             import traceback
             traceback.print_exc()
             raise
-
-
 
     def evaluate_model(self, true_fsr, predicted_fsr):
         """评估模型性能"""
@@ -330,7 +357,6 @@ class PyTorchFSRPredictor:
         else:
             mape = float('nan')
 
-
         # 计算 R² 分数
         r2_scores = []
         for i in range(true_fsr.shape[1]):
@@ -351,12 +377,7 @@ def moving_average(data, window_size, axis=0):
     smoothed_data = np.apply_along_axis(lambda m: np.convolve(m, np.ones(window_size), 'same') / window_size, axis, data)
     return smoothed_data
 
-
-
 if __name__ == '__main__':
-    plt.rcParams['font.sans-serif'] = ['SimHei']
-    plt.rcParams['axes.unicode_minus'] = False
-
     # 加载数据
     csv_file_path = "../datasets/filtered_insole_data4.csv"
     timestamps, fsr_values = load_fsr_data(csv_file_path)
@@ -372,7 +393,7 @@ if __name__ == '__main__':
     processed_fsr = processed_fsr[:num_samples]
 
     # 设置序列长度
-    sequence_length = 40
+    sequence_length = 32
 
     # 原始静态特征
     weight = 100  # 体重(kg)
@@ -380,37 +401,35 @@ if __name__ == '__main__':
     shoe_size = 40  # 鞋码
 
     # 手动归一化静态特征
-    # 定义特征的合理范围
-    weight_range = (40, 120)  # 体重范围：40-120kg
-    height_range = (150, 190)  # 身高范围：150-190cm
-    shoe_size_range = (35, 45)  # 鞋码范围：35-45
+    weight_range = (40, 120)
+    height_range = (150, 190)
+    shoe_size_range = (35, 45)
 
-    # 归一化计算
     normalized_weight = (weight - weight_range[0]) / (weight_range[1] - weight_range[0])
     normalized_height = (height - height_range[0]) / (height_range[1] - height_range[0])
     normalized_shoe_size = (shoe_size - shoe_size_range[0]) / (shoe_size_range[1] - shoe_size_range[0])
 
     # 组合归一化后的静态特征
-    static_features = [normalized_weight, normalized_height, normalized_shoe_size]
+    static_features = torch.tensor([normalized_weight, normalized_height, normalized_shoe_size], dtype=torch.float32)
 
     # 初始化预测器
     predictor = PyTorchFSRPredictor(
-        hidden_size=256,
-        num_layers=5,
+        seq_input_size=processed_pose_data.shape[1] * processed_pose_data.shape[2],  # 序列特征维度
+        static_input_size=len(static_features),  # 静态特征维度
+        hidden_size=128,
+        num_layers=4,
+        output_size=processed_fsr.shape[1],  # FSR传感器数量
         learning_rate=0.001,
-        batch_size=128,
-        num_epochs=200,
-        dropout_rate=0.3
+        batch_size=64,
+        num_epochs=100,
+        dropout_rate=0.2
     )
 
     # 准备序列数据
     train_loader, val_loader, scaler_pose, scaler_fsr = predictor.prepare_sequence_data(
         processed_pose_data, processed_fsr, sequence_length, static_features)
 
-    # 构建和训练模型
-    input_size = processed_pose_data.shape[1] * processed_pose_data.shape[2] + len(static_features)
-    output_size = processed_fsr.shape[1]
-    predictor.model = predictor.build_model(input_size, output_size).to(predictor.device)
+    # 训练模型
     predictor.train_model(train_loader, val_loader)
 
     # 预测和评估

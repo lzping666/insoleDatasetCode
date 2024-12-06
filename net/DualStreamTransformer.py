@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -6,16 +8,15 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import r2_score
 
-from caculate.augmentation import DataAugmentation
 from caculate.fsr_processor import load_fsr_data
 from caculate.pose_processor import load_pose_data
+from caculate.augmentation import DataAugmentation
 
 
-
-def preprocess_fsr_data(fsr_values, smooth_window=25):
+def preprocess_fsr_data(fsr_values, smooth_window=5):
     """
     预处理FSR数据
 
@@ -60,142 +61,227 @@ def preprocess_pose_data(pose_data, smooth_window=5):
     return processed_pose
 
 
-
-# class HybridLSTMModel(nn.Module):
-#     def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers, output_size, dropout_rate=0.2):
-#         super(HybridLSTMModel, self).__init__()
+# class DualStreamTransformer(nn.Module):
+#     def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers, output_size,
+#                  n_heads=4, dropout_rate=0.3):
+#         super(DualStreamTransformer, self).__init__()
 #         self.hidden_size = hidden_size
 #         self.num_layers = num_layers
 #
-#         # 序列特征处理
-#         self.batch_norm1 = nn.BatchNorm1d(seq_input_size)
-#         self.lstm = nn.LSTM(seq_input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_rate)
+#         # 序列特征的处理层
+#         self.seq_embedding = nn.Linear(seq_input_size, hidden_size)
+#         self.pos_encoder = PositionalEncoding(hidden_size, dropout_rate)
 #
-#         # 添加自注意力层
-#         self.attention = nn.MultiheadAttention(hidden_size, num_heads=4, dropout=dropout_rate)
+#         # 序列特征的Transformer编码器
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=hidden_size,
+#             nhead=n_heads,
+#             dim_feedforward=hidden_size * 4,
+#             dropout=dropout_rate,
+#             batch_first=True
+#         )
+#         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 #
-#         self.dropout = nn.Dropout(dropout_rate)
-#         self.batch_norm2 = nn.BatchNorm1d(hidden_size)
+#         # 静态特征的处理层
+#         self.static_embedding = nn.Linear(static_input_size, hidden_size)
 #
-#         # 静态特征处理
-#         self.static_batch_norm = nn.BatchNorm1d(static_input_size)
-#         self.static_fc = nn.Sequential(
-#             nn.Linear(static_input_size, hidden_size // 8),
+#         # 静态特征的Transformer编码器
+#         static_encoder_layer = nn.TransformerEncoderLayer(
+#             d_model=hidden_size,
+#             nhead=n_heads,
+#             dim_feedforward=hidden_size * 4,
+#             dropout=dropout_rate,
+#             batch_first=True
+#         )
+#         self.static_transformer = nn.TransformerEncoder(static_encoder_layer, num_layers=num_layers)
+#
+#         # 批归一化和层归一化
+#         self.seq_bn = nn.BatchNorm1d(seq_input_size)
+#         self.static_bn = nn.BatchNorm1d(static_input_size)
+#         self.layer_norm1 = nn.LayerNorm(hidden_size)
+#         self.layer_norm2 = nn.LayerNorm(hidden_size)
+#
+#         # 特征融合层
+#         self.fusion = nn.Sequential(
+#             nn.Linear(hidden_size * 2, hidden_size * 2),
 #             nn.ReLU(),
 #             nn.Dropout(dropout_rate),
-#             nn.BatchNorm1d(hidden_size // 8)
-#         )
-#
-#         # 融合层
-#         self.fusion_layer = nn.Sequential(
-#             nn.Linear(hidden_size + hidden_size // 8, hidden_size // 2),
+#             nn.LayerNorm(hidden_size * 2),
+#             nn.Linear(hidden_size * 2, hidden_size),
 #             nn.ReLU(),
-#             nn.Dropout(dropout_rate),
-#             nn.BatchNorm1d(hidden_size // 2)
+#             nn.Dropout(dropout_rate / 2),
+#             nn.LayerNorm(hidden_size),
+#             nn.Linear(hidden_size, output_size)
 #         )
-#
-#         # 输出层
-#         self.fc = nn.Linear(hidden_size // 2, output_size)
 #
 #         # 残差连接
-#         self.residual_fc = nn.Linear(seq_input_size, output_size)
+#         self.residual_proj = nn.Linear(seq_input_size, output_size)
+#
+#         # 注意力层 - 用于融合序列和静态特征
+#         self.attention = nn.MultiheadAttention(hidden_size, n_heads, dropout=dropout_rate, batch_first=True)
+#
+#         # 额外的正则化层
+#         self.dropout = nn.Dropout(dropout_rate)
 #
 #     def forward(self, seq_x, static_x):
 #         batch_size = seq_x.size(0)
 #
-#         # 序列特征处理
+#         # 序列特征预处理
 #         seq_x = seq_x.transpose(1, 2)
-#         seq_x = self.batch_norm1(seq_x)
+#         seq_x = self.seq_bn(seq_x)
 #         seq_x = seq_x.transpose(1, 2)
 #
-#         # LSTM处理
-#         lstm_out, _ = self.lstm(seq_x)
+#         # 保存用于残差连接的最后时间步
+#         residual = self.residual_proj(seq_x[:, -1, :])
 #
-#         # 自注意力处理
-#         attn_out, _ = self.attention(lstm_out.transpose(0, 1),
-#                                      lstm_out.transpose(0, 1),
-#                                      lstm_out.transpose(0, 1))
-#         attn_out = attn_out.transpose(0, 1)
+#         # 序列特征处理流
+#         seq_embedded = self.seq_embedding(seq_x)  # [batch_size, seq_len, hidden_size]
+#         seq_embedded = self.pos_encoder(seq_embedded)
+#         seq_embedded = self.dropout(seq_embedded)
 #
-#         # 残差连接
-#         lstm_out = lstm_out + attn_out
+#         # Transformer编码
+#         seq_encoded = self.transformer_encoder(seq_embedded)
+#         seq_encoded = self.layer_norm1(seq_encoded)
 #
-#         lstm_out = self.dropout(lstm_out)
-#         lstm_out = lstm_out.transpose(1, 2)
-#         lstm_out = self.batch_norm2(lstm_out)
-#         lstm_out = lstm_out.transpose(1, 2)
-#         lstm_out = lstm_out[:, -1, :]
+#         # 全局池化 + 最大池化的组合
+#         seq_mean = seq_encoded.mean(dim=1)  # [batch_size, hidden_size]
+#         seq_max, _ = seq_encoded.max(dim=1)  # [batch_size, hidden_size]
+#         seq_feature = (seq_mean + seq_max) / 2
 #
-#         # 静态特征处理
-#         static_x = self.static_batch_norm(static_x)
-#         static_out = self.static_fc(static_x)
+#         # 静态特征预处理
+#         static_x = self.static_bn(static_x)
+#
+#         # 静态特征处理流
+#         static_embedded = self.static_embedding(static_x).unsqueeze(1)  # [batch_size, 1, hidden_size]
+#         static_embedded = self.dropout(static_embedded)
+#
+#         # Transformer编码
+#         static_encoded = self.static_transformer(static_embedded)
+#         static_encoded = self.layer_norm2(static_encoded)
+#         static_feature = static_encoded.squeeze(1)  # [batch_size, hidden_size]
+#
+#         # 注意力机制融合
+#         seq_feature = seq_feature.unsqueeze(1)  # [batch_size, 1, hidden_size]
+#         static_feature = static_feature.unsqueeze(1)  # [batch_size, 1, hidden_size]
+#         attn_output, _ = self.attention(seq_feature, static_feature, static_feature)
+#         attn_output = attn_output.squeeze(1)  # [batch_size, hidden_size]
 #
 #         # 特征融合
-#         combined = torch.cat([lstm_out, static_out], dim=1)
-#         fused = self.fusion_layer(combined)
+#         combined = torch.cat([seq_feature.squeeze(1), attn_output], dim=1)
+#         output = self.fusion(combined)
 #
-#         # 输出层
-#         output = self.fc(fused)
-#
-#         # 残差连接
-#         residual = self.residual_fc(seq_x[:, -1, :])
+#         # 添加残差连接
 #         output = output + residual
 #
 #         return output
+#
+#
+# class PositionalEncoding(nn.Module):
+#     def __init__(self, d_model, dropout=0.1, max_len=5000):
+#         super(PositionalEncoding, self).__init__()
+#         self.dropout = nn.Dropout(p=dropout)
+#
+#         position = torch.arange(max_len).unsqueeze(1)
+#         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+#         pe = torch.zeros(max_len, 1, d_model)
+#         pe[:, 0, 0::2] = torch.sin(position * div_term)
+#         pe[:, 0, 1::2] = torch.cos(position * div_term)
+#         pe = pe.transpose(0, 1)
+#         self.register_buffer('pe', pe)
+#
+#     def forward(self, x):
+#         x = x + self.pe[:, :x.size(1)]
+#         return self.dropout(x)
 
-class HybridLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers, output_size, dropout_rate=0.2):
-        super(HybridLSTMModel, self).__init__()
+class DualStreamTransformer(nn.Module):
+    def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers, output_size,
+                 n_heads=4, dropout_rate=0.2):
+        super(DualStreamTransformer, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
 
         # 序列特征的处理层
-        self.batch_norm1 = nn.BatchNorm1d(seq_input_size)
-        self.lstm = nn.LSTM(seq_input_size, hidden_size, num_layers, batch_first=True, dropout=dropout_rate)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.batch_norm2 = nn.BatchNorm1d(hidden_size)
+        self.seq_embedding = nn.Linear(seq_input_size, hidden_size)
+        self.pos_encoder = PositionalEncoding(hidden_size, dropout_rate)
 
-        # 静态特征的处理层 - 减少维度扩展
-        self.static_batch_norm = nn.BatchNorm1d(static_input_size)
-        self.static_fc = nn.Sequential(
-            nn.Linear(static_input_size, hidden_size // 8),  # 只扩展到hidden_size的1/4
+        # 序列特征的Transformer编码器
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=n_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout_rate,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 静态特征的处理层
+        self.static_embedding = nn.Linear(static_input_size, hidden_size)
+
+        # 静态特征的Transformer编码器
+        static_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=n_heads,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout_rate,
+            batch_first=True
+        )
+        self.static_transformer = nn.TransformerEncoder(static_encoder_layer, num_layers=num_layers)
+
+        # 批归一化层
+        self.seq_bn = nn.BatchNorm1d(seq_input_size)
+        self.static_bn = nn.BatchNorm1d(static_input_size)
+
+        # 特征融合和输出层
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.BatchNorm1d(hidden_size // 8)
+            nn.Linear(hidden_size, output_size)
         )
 
-        # 合并后的输出层
-        self.fc = nn.Linear(hidden_size + hidden_size // 8, output_size)  # 减少了合并后的维度
-
     def forward(self, seq_x, static_x):
-        batch_size = seq_x.size(0)
-        seq_len = seq_x.size(1)
-
-        # 处理序列特征
+        # 序列特征预处理
         seq_x = seq_x.transpose(1, 2)
-        seq_x = self.batch_norm1(seq_x)
+        seq_x = self.seq_bn(seq_x)
         seq_x = seq_x.transpose(1, 2)
 
-        # LSTM layers
-        lstm_out, _ = self.lstm(seq_x)
-        lstm_out = self.dropout(lstm_out)
-        lstm_out = lstm_out.transpose(1, 2)
-        lstm_out = self.batch_norm2(lstm_out)
-        lstm_out = lstm_out.transpose(1, 2)
-        lstm_out = lstm_out[:, -1, :]  # (batch_size, hidden_size)
+        # 序列特征处理流
+        seq_embedded = self.seq_embedding(seq_x)  # [batch_size, seq_len, hidden_size]
+        seq_embedded = self.pos_encoder(seq_embedded)
+        seq_encoded = self.transformer_encoder(seq_embedded)
+        seq_feature = seq_encoded.mean(dim=1)  # 全局池化 [batch_size, hidden_size]
 
-        # 处理静态特征 - 维度更小
-        static_x = self.static_batch_norm(static_x)
-        static_out = self.static_fc(static_x)  # (batch_size, hidden_size//4)
+        # 静态特征预处理
+        static_x = self.static_bn(static_x)
 
-        # 合并序列特征和静态特征
-        combined = torch.cat([lstm_out, static_out], dim=1)  # (batch_size, hidden_size + hidden_size//4)
+        # 静态特征处理流
+        static_embedded = self.static_embedding(static_x).unsqueeze(1)  # [batch_size, 1, hidden_size]
+        static_encoded = self.static_transformer(static_embedded)
+        static_feature = static_encoded.squeeze(1)  # [batch_size, hidden_size]
 
-        # 输出层
-        output = self.fc(combined)
+        # 特征融合
+        combined = torch.cat([seq_feature, static_feature], dim=1)
+        output = self.fusion(combined)
+
         return output
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
+        pe = pe.transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
 
 class PyTorchFSRPredictor:
     def __init__(self, seq_input_size, static_input_size, hidden_size, num_layers, output_size,
@@ -216,7 +302,7 @@ class PyTorchFSRPredictor:
         self.model = self.model.to(self.device)
 
     def build_model(self):
-        return HybridLSTMModel(
+        return DualStreamTransformer(
             seq_input_size=self.seq_input_size,
             static_input_size=self.static_input_size,
             hidden_size=self.hidden_size,
@@ -224,6 +310,73 @@ class PyTorchFSRPredictor:
             output_size=self.output_size,
             dropout_rate=self.dropout_rate
         )
+
+
+
+    # 准备用于训练和验证的序列数据 姿态数据从三维（frames, 33, 3）展平为二维（frames, 99）
+    # def prepare_sequence_data(self, pose_data, fsr_data, sequence_length, static_features, test_size=0.2):
+    #     X_sequences = []
+    #     y_sequences = []
+    #
+    #     # 展平姿态数据
+    #     pose_features = pose_data.reshape(pose_data.shape[0], -1)
+    #
+    #     # 使用MinMaxScaler来确保数据在0-1之间
+    #     scaler_pose = MinMaxScaler(feature_range=(0, 1))
+    #     scaler_fsr = MinMaxScaler(feature_range=(0, 1))
+    #
+    #     pose_features_scaled = scaler_pose.fit_transform(pose_features)
+    #     fsr_scaled = scaler_fsr.fit_transform(fsr_data)
+    #
+    #     # 保存scaler为类属性，用于后续反转换
+    #     self.scaler_fsr = scaler_fsr
+    #     self.scaler_pose = scaler_pose
+    #
+    #     # 创建序列
+    #     stride = 1
+    #     for i in range(0, len(pose_features_scaled) - sequence_length + 1, stride):
+    #         X_sequences.append(pose_features_scaled[i:i + sequence_length])
+    #         y_sequences.append(fsr_scaled[i:i + sequence_length])
+    #
+    #     X_sequences = np.array(X_sequences)
+    #     y_sequences = np.array(y_sequences)
+    #
+    #     # Train-test split with shuffle
+    #     indices = np.arange(len(X_sequences))
+    #     np.random.shuffle(indices)
+    #     train_size = int(len(indices) * (1 - test_size))
+    #
+    #     train_indices = indices[:train_size]
+    #     test_indices = indices[train_size:]
+    #
+    #     # 创建数据加载器
+    #     X_train_seq = torch.FloatTensor(X_sequences[train_indices]).to(self.device)
+    #     y_train = torch.FloatTensor(y_sequences[train_indices]).to(self.device)
+    #     X_test_seq = torch.FloatTensor(X_sequences[test_indices]).to(self.device)
+    #     y_test = torch.FloatTensor(y_sequences[test_indices]).to(self.device)
+    #
+    #     # 数据增强
+    #     X_train_seq_augmented = self.add_noise(X_train_seq)
+    #     y_train_augmented = y_train
+    #
+    #     # 合并原始数据和增强数据
+    #     X_train_seq = torch.cat([X_train_seq, X_train_seq_augmented], dim=0)
+    #     y_train = torch.cat([y_train, y_train_augmented], dim=0)
+    #
+    #     # 准备静态特征
+    #     static_features = static_features.to(self.device)
+    #     # 扩展静态特征以匹配序列数据的批次大小
+    #     X_train_static = static_features.unsqueeze(0).repeat(len(X_train_seq), 1)
+    #     X_test_static = static_features.unsqueeze(0).repeat(len(X_test_seq), 1)
+    #
+    #     # 创建包含序列特征和静态特征的数据集
+    #     train_dataset = TensorDataset(X_train_seq, X_train_static, y_train)
+    #     test_dataset = TensorDataset(X_test_seq, X_test_static, y_test)
+    #
+    #     train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
+    #     test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
+    #
+    #     return train_loader, test_loader, scaler_pose, scaler_fsr
 
     def prepare_sequence_data(self, pose_data, fsr_data, sequence_length, static_features, test_size=0.2):
         X_sequences = []
@@ -275,7 +428,7 @@ class PyTorchFSRPredictor:
 
         # 应用不同的增强组合
         aug_combinations = [
-            ['noise', 'mask', 'wrap'],
+            ['noise', 'mask'],
         ]
 
         for aug_types in aug_combinations:
@@ -300,7 +453,6 @@ class PyTorchFSRPredictor:
         test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
 
         return train_loader, test_loader, scaler_pose, scaler_fsr
-
 
     def train_model(self, train_loader, val_loader):
         criterion = nn.MSELoss()
@@ -387,7 +539,7 @@ class PyTorchFSRPredictor:
 
     def process_sequence(self, pose_data, fsr_data, static_features):
         try:
-            sequence_length = 32
+            sequence_length = 128
             pose_features = pose_data.reshape(pose_data.shape[0], -1)
 
             X_sequences = []
@@ -441,8 +593,8 @@ class PyTorchFSRPredictor:
             predicted_fsr = self.scaler_fsr.inverse_transform(predicted_fsr_reshaped)
             # 剪裁负值，确保数据合理
             predicted_fsr = np.clip(predicted_fsr, self.scaler_fsr.data_min_, self.scaler_fsr.data_max_)
-            # predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
-            return predicted_fsr
+            predicted_fsr_smoothed = self.moving_average(predicted_fsr, window_size=10)
+            return predicted_fsr_smoothed
 
         except Exception as e:
             print(f"Error occurred: {str(e)}")
@@ -514,7 +666,7 @@ if __name__ == '__main__':
     processed_fsr = processed_fsr[:num_samples]
 
     # 设置序列长度
-    sequence_length = 32
+    sequence_length = 128
 
     # 原始静态特征
     weight = 100  # 体重(kg)
@@ -526,11 +678,11 @@ if __name__ == '__main__':
     height_range = (150, 190)
     shoe_size_range = (35, 45)
     age_range = (18, 40)
+
     normalized_weight = (weight - weight_range[0]) / (weight_range[1] - weight_range[0])
     normalized_height = (height - height_range[0]) / (height_range[1] - height_range[0])
     normalized_shoe_size = (shoe_size - shoe_size_range[0]) / (shoe_size_range[1] - shoe_size_range[0])
     normalized_age = (age - age_range[0]) / (age_range[1] - age_range[0])
-
     # 组合归一化后的静态特征
     static_features = torch.tensor([normalized_weight, normalized_height, normalized_shoe_size,normalized_age], dtype=torch.float32)
 
@@ -539,10 +691,10 @@ if __name__ == '__main__':
         seq_input_size=processed_pose_data.shape[1] * processed_pose_data.shape[2],  # 序列特征维度
         static_input_size=len(static_features),  # 静态特征维度
         hidden_size=256,
-        num_layers=5,
+        num_layers=6,
         output_size=processed_fsr.shape[1],  # FSR传感器数量
         learning_rate=0.001,
-        batch_size=128,
+        batch_size=64,
         num_epochs=200,
         dropout_rate=0.3
     )
