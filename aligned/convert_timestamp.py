@@ -21,7 +21,8 @@ def convert_timestamp_format(input_file, output_file):
 
 # 示例调用
 if __name__ == '__main__':
-    input_file = "../datasets/filtered_insole_data3.csv"  # 输入文件路径
-    output_file = "../datasets/filtered_insole_data4.csv"  # 输出文件路径
+    username = 'zsb'
+    input_file = f"../datasets/{username}/filtered_insole_data1.csv"  # 输入文件路径
+    output_file = f"../datasets/{username}/filtered_insole_data2.csv"  # 输出文件路径
 
     convert_timestamp_format(input_file, output_file)

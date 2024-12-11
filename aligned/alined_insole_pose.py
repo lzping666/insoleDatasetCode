@@ -41,8 +41,9 @@ def downsample_insole_to_pose(pose_file, insole_file, output_file):
     print(f"降采样完成，已保存到: {output_file}")
 
 if __name__ == '__main__':
-    pose_file = "../datasets/pose3.csv"  # 姿态数据 CSV 文件路径
-    insole_file = "../datasets/labeled/right_data_fixed.csv"  # 鞋垫数据 CSV 文件路径
-    output_file = "aligned_insole_data.csv"  # 输出对齐后的鞋垫数据 CSV 文件路径
+    username = "zsb"
+    pose_file = f"../datasets/{username}/pose1.csv"  # 姿态数据 CSV 文件路径
+    insole_file = f"../datasets/{username}/right_data_fixed.csv"  # 鞋垫数据 CSV 文件路径
+    output_file = f"../datasets/{username}/aligned_insole_data.csv"  # 输出对齐后的鞋垫数据 CSV 文件路径
 
     downsample_insole_to_pose(pose_file, insole_file, output_file)

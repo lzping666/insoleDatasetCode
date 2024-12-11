@@ -28,7 +28,8 @@ def remove_pose_data(input_file, output_file):
 
 
 if __name__ == '__main__':
-    input_file = "aligned_insole_data.csv"  # 输入对齐后的文件路径
-    output_file = "../datasets/filtered_insole_data3.csv"  # 输出仅包含时间戳和鞋垫数据的文件路径
+    username = 'zsb'
+    input_file = f"../datasets/{username}/aligned_insole_data.csv"  # 输入对齐后的文件路径
+    output_file = f"../datasets/{username}/filtered_insole_data1.csv"  # 输出仅包含时间戳和鞋垫数据的文件路径
 
     remove_pose_data(input_file, output_file)
